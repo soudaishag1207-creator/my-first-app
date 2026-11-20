@@ -1,0 +1,17 @@
+{
+  "manifest_version": 3,
+  "name": "英語ページ自動翻訳",
+  "version": "1.0.0",
+  "description": "英語のページを開くと「日本語に翻訳しますか？」と確認し、はいを選ぶと日本語に翻訳します。",
+  "permissions": ["storage"],
+  "host_permissions": ["https://translate.googleapis.com/*"],
+  "background": { "service_worker": "background.js" },
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": { "default_title": "英語ページ自動翻訳", "default_popup": "popup.html" }
+}
