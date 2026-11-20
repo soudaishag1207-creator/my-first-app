@@ -57,4 +57,5 @@
 ## 注意
 
 - `extension` フォルダはパソコン用、`mobile` フォルダはスマホ用です。
+- `CLAUDE.md` と `.claude/skills/` は Claude Code 用の設定です。パソコンの Claude Code に入れる方法は [claude-setup/README.md](claude-setup/README.md) を見てください。
 - ページの文章を翻訳サービスに送るので、社内システムなど機密情報が表示されるページでは「このサイトでは聞かない」を選んでください。
