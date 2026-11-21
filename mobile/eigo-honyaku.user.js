@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         英語ページ自動翻訳（スマホ対応版）
 // @namespace    https://github.com/soudaishag1207-creator/my-first-app
-// @version      1.0.0
+// @version      1.1.0
 // @description  英語のページを開くと「日本語に翻訳しますか？」と確認し、はいを選ぶと日本語に翻訳します。
 // @match        *://*/*
 // @run-at       document-idle
@@ -168,6 +168,35 @@
     return nodes;
   }
 
+  // ---------- 日本語のページの中にある英語の文章 ----------
+  // ページ全体は英語でなくても、英語の文章がまとまってあれば「英語の部分」だけ翻訳する。
+  const JA_RE = /[぀-ヿ一-龯]/;
+  const EN_COMMON = new Set(
+    "the of and to in is that for it with as was on are be this by you or from at have not an they which but we can all your more will their has one if about my i me so just".split(" ")
+  );
+  const PARTIAL_MIN_WORDS = 25; // 英語の文章が合計でこの単語数以上あれば聞く
+
+  // 英語の文章なら単語数を、そうでなければ 0 を返す
+  function englishWords(text) {
+    if (JA_RE.test(text)) return 0;
+    const words = text.toLowerCase().match(/[a-z']+/g) || [];
+    if (words.length < 3) return 0; // 「Today」「Safari」のような単語だけのものは除く
+    return words.some((w) => EN_COMMON.has(w)) ? words.length : 0;
+  }
+
+  function countEnglishWords(root) {
+    let total = 0;
+    for (const n of collectTextNodes(root)) {
+      const w = englishWords(n.nodeValue);
+      if (w >= 6) total += w;
+    }
+    return total;
+  }
+
+  let mode = "page"; // "page" = ページ全体を翻訳 / "partial" = 英語の文章だけ翻訳
+  const targetsOf = (nodes) =>
+    mode === "partial" ? nodes.filter((n) => englishWords(n.nodeValue) > 0) : nodes;
+
   async function translateNodes(nodes) {
     const BATCH = 8; // スマホの通信を詰まらせないよう、同時に送る数を控えめに
     let failures = 0;
@@ -190,11 +219,11 @@
   async function translatePage() {
     showBanner({ title: "翻訳中…", message: "ページを日本語に翻訳しています。", buttons: [] });
     try {
-      await translateNodes(collectTextNodes(document.body));
+      await translateNodes(targetsOf(collectTextNodes(document.body)));
       translated = true;
       watchNewContent();
       showBanner({
-        title: "日本語に翻訳しました",
+        title: mode === "partial" ? "英語の部分を翻訳しました" : "日本語に翻訳しました",
         buttons: [
           { label: "元に戻す", onClick: restorePage },
           { label: "閉じる", onClick: removeBanner },
@@ -224,7 +253,7 @@
       }
       clearTimeout(timer);
       timer = setTimeout(() => {
-        const nodes = [...new Set(pending)].filter((n) => !originals.has(n));
+        const nodes = targetsOf([...new Set(pending)].filter((n) => !originals.has(n)));
         pending = [];
         if (nodes.length) translateNodes(nodes).catch(() => {});
       }, 600);
@@ -247,22 +276,54 @@
     });
   }
 
-  // ---------- 起動 ----------
-  async function main() {
-    if ((await store.get("neverSites", [])).includes(host)) return;
-    if (!isEnglishPage()) return;
-    if ((await store.get("alwaysSites", [])).includes(host)) return translatePage();
 
+  // 英語のページか、英語の部分があるページかを調べる。
+  // レビューなどが後から読み込まれることがあるので、最初に見つからなければ少し待って調べ直す。
+  function waitForEnglish(isWholePageEnglish) {
+    const check = async () => {
+      if (await isWholePageEnglish()) return "page";
+      if (countEnglishWords(document.body) >= PARTIAL_MIN_WORDS) return "partial";
+      return null;
+    };
+    return new Promise(async (resolve) => {
+      const first = await check();
+      if (first || !document.body) return resolve(first);
+      let timer = null;
+      const watcher = new MutationObserver(() => {
+        clearTimeout(timer);
+        timer = setTimeout(async () => {
+          const found = await check();
+          if (found) { stop(); resolve(found); }
+        }, 1000);
+      });
+      const stop = () => { watcher.disconnect(); clearTimeout(timer); clearTimeout(limit); };
+      const limit = setTimeout(() => { stop(); resolve(null); }, 20000);
+      watcher.observe(document.body, { childList: true, subtree: true, characterData: true });
+    });
+  }
+
+  function askToTranslate(onAlways, onNever) {
+    const partial = mode === "partial";
     showBanner({
-      title: "日本語に翻訳しますか？",
-      message: "このページは英語のようです。",
+      title: partial ? "英語の部分を翻訳しますか？" : "日本語に翻訳しますか？",
+      message: partial ? "このページには英語の文章があります。" : "このページは英語のようです。",
       buttons: [
         { label: "はい", kind: "primary", onClick: translatePage },
         { label: "いいえ", onClick: removeBanner },
-        { label: "このサイトは常に翻訳", kind: "link", onClick: () => { addSite("alwaysSites"); translatePage(); } },
-        { label: "このサイトでは聞かない", kind: "link", onClick: () => { addSite("neverSites"); removeBanner(); } },
+        { label: "このサイトは常に翻訳", kind: "link", onClick: () => { onAlways(); translatePage(); } },
+        { label: "このサイトでは聞かない", kind: "link", onClick: () => { onNever(); removeBanner(); } },
       ],
     });
+  }
+
+  // ---------- 起動 ----------
+  async function main() {
+    if ((await store.get("neverSites", [])).includes(host)) return;
+    const found = await waitForEnglish(async () => isEnglishPage());
+    if (!found) return;
+    mode = found;
+    if ((await store.get("alwaysSites", [])).includes(host)) return translatePage();
+    askToTranslate(() => addSite("alwaysSites"), () => addSite("neverSites"));
   }
 
   main();
