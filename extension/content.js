@@ -168,22 +168,26 @@
   async function translateTexts(texts) {
     const tr = await getBuiltinTranslator();
     if (tr) {
-      return Promise.all(texts.map((t) => tr.translate(t).catch(() => null)));
+      return { results: await Promise.all(texts.map((t) => tr.translate(t).catch(() => null))) };
     }
     const res = await chrome.runtime.sendMessage({ type: "translate", texts });
     if (!res?.ok) throw new Error(res?.error || "翻訳に失敗しました");
-    return res.results;
+    return res;
   }
 
   async function translateNodes(nodes) {
-    const BATCH = 20;
-    for (let i = 0; i < nodes.length; i += BATCH) {
-      const chunk = nodes.slice(i, i + BATCH);
+    const CHUNK = 40; // 40個ずつ画面に反映していく
+    let done = 0, lastError = null, rateLimited = false;
+    for (let i = 0; i < nodes.length && !rateLimited; i += CHUNK) {
+      const chunk = nodes.slice(i, i + CHUNK);
       const texts = chunk.map((n) => n.nodeValue.trim());
-      const results = await translateTexts(texts);
+      const { results, error, rateLimited: limited } = await translateTexts(texts);
+      if (error) lastError = error;
+      rateLimited = !!limited;
       chunk.forEach((n, j) => {
         const ja = results[j];
         if (!ja) return;
+        done++;
         const orig = n.nodeValue;
         originals.set(n, orig);
         // 前後の空白は元のまま残す
@@ -192,6 +196,7 @@
         n.nodeValue = lead + ja + trail;
       });
     }
+    if (nodes.length && done === 0) throw new Error(lastError || "翻訳サーバーにつながりませんでした");
   }
 
   async function translatePage() {
@@ -213,7 +218,10 @@
       showBanner({
         title: "翻訳できませんでした",
         message: String(e.message || e),
-        buttons: [{ label: "閉じる", onClick: removeBanner }],
+        buttons: [
+          { label: "もう一度試す", kind: "primary", onClick: translatePage },
+          { label: "閉じる", onClick: removeBanner },
+        ],
       });
     }
   }

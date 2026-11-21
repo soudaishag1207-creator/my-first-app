@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         英語ページ自動翻訳（スマホ対応版）
 // @namespace    https://github.com/soudaishag1207-creator/my-first-app
-// @version      1.1.0
+// @version      1.2.0
 // @description  英語のページを開くと「日本語に翻訳しますか？」と確認し、はいを選ぶと日本語に翻訳します。
 // @match        *://*/*
 // @run-at       document-idle
@@ -127,14 +127,17 @@
     const xhr =
       (typeof GM !== "undefined" && GM.xmlHttpRequest) ||
       (typeof GM_xmlhttpRequest !== "undefined" && GM_xmlhttpRequest);
-    if (!xhr) return fetch(url).then((r) => r.text());
+    const fail = (status, msg) => Object.assign(new Error(msg), { status });
+    if (!xhr)
+      return fetch(url).then((r) => (r.ok ? r.text() : Promise.reject(fail(r.status, "エラー " + r.status))));
     return new Promise((resolve, reject) =>
       xhr({
         method: "GET",
         url,
-        onload: (r) => (r.status === 200 ? resolve(r.responseText) : reject(new Error("翻訳サーバーエラー: " + r.status))),
-        onerror: () => reject(new Error("通信に失敗しました")),
-        ontimeout: () => reject(new Error("通信がタイムアウトしました")),
+        timeout: 15000,
+        onload: (r) => (r.status === 200 ? resolve(r.responseText) : reject(fail(r.status, "エラー " + r.status))),
+        onerror: () => reject(fail(0, "通信に失敗しました")),
+        ontimeout: () => reject(fail(0, "通信がタイムアウトしました")),
       })
     );
   }
@@ -145,6 +148,62 @@
       encodeURIComponent(text);
     const data = JSON.parse(await httpGet(url));
     return (data[0] || []).map((p) => p[0]).join("");
+  }
+
+  // 文章をいくつかまとめて1回で送る。問い合わせの回数を減らし、「使いすぎ」で断られにくくする。
+  const MAX_CHARS = 1500;
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  function friendlyError(e) {
+    if (!e) return "翻訳サーバーにつながりませんでした";
+    if (e.status === 429) return "翻訳サーバーが混み合っています（短い時間に使いすぎ）。数分おいてから、もう一度試してください。";
+    return "翻訳サーバーにつながりませんでした（" + (e.message || e) + "）";
+  }
+
+  // 失敗したら少し待ってやり直す（最大3回）
+  async function requestTranslation(text) {
+    const TRIES = 3;
+    for (let attempt = 1; ; attempt++) {
+      try {
+        return await translateOne(text);
+      } catch (e) {
+        if (attempt >= TRIES) throw e;
+        await sleep((e.status === 429 ? 1500 : 700) * attempt);
+      }
+    }
+  }
+
+  // texts をまとめて翻訳し、{ results: [訳 or null], error } を返す
+  async function translateMany(texts) {
+    const results = new Array(texts.length).fill(null);
+    let error = null;
+    const groups = [];
+    let cur = [], len = 0;
+    texts.forEach((t, i) => {
+      if (cur.length && len + t.length > MAX_CHARS) { groups.push(cur); cur = []; len = 0; }
+      cur.push(i);
+      len += t.length + 1;
+    });
+    if (cur.length) groups.push(cur);
+
+    for (const group of groups) {
+      const parts = group.map((i) => texts[i].replace(/\s+/g, " ").trim());
+      try {
+        const out = (await requestTranslation(parts.join("\n"))).split("\n").map((s) => s.trim());
+        if (out.length === parts.length) {
+          group.forEach((i, k) => (results[i] = out[k] || null));
+          continue;
+        }
+        // 行がずれて返ってきたときは1つずつ翻訳し直す
+        for (let k = 0; k < group.length; k++) {
+          results[group[k]] = await requestTranslation(parts[k]).catch((e) => ((error = e), null));
+        }
+      } catch (e) {
+        error = e;
+        if (e.status === 429) break; // 断られたら、それ以上送らない
+      }
+    }
+    return { results, error };
   }
 
   const originals = new Map();
@@ -198,22 +257,23 @@
     mode === "partial" ? nodes.filter((n) => englishWords(n.nodeValue) > 0) : nodes;
 
   async function translateNodes(nodes) {
-    const BATCH = 8; // スマホの通信を詰まらせないよう、同時に送る数を控えめに
-    let failures = 0;
-    for (let i = 0; i < nodes.length; i += BATCH) {
-      const chunk = nodes.slice(i, i + BATCH);
-      const results = await Promise.all(
-        chunk.map((n) => translateOne(n.nodeValue.trim()).catch(() => (failures++, null)))
-      );
+    const CHUNK = 40; // 40個ずつ画面に反映していく
+    let done = 0, lastError = null;
+    for (let i = 0; i < nodes.length; i += CHUNK) {
+      const chunk = nodes.slice(i, i + CHUNK);
+      const { results, error } = await translateMany(chunk.map((n) => n.nodeValue));
+      if (error) lastError = error;
       chunk.forEach((n, j) => {
         const ja = results[j];
         if (!ja) return;
+        done++;
         const orig = n.nodeValue;
         originals.set(n, orig);
         n.nodeValue = orig.match(/^\s*/)[0] + ja + orig.match(/\s*$/)[0];
       });
+      if (error?.status === 429) break;
     }
-    if (nodes.length && failures === nodes.length) throw new Error("翻訳サーバーにつながりませんでした");
+    if (nodes.length && done === 0) throw new Error(friendlyError(lastError));
   }
 
   async function translatePage() {
@@ -234,7 +294,10 @@
       showBanner({
         title: "翻訳できませんでした",
         message: String(e.message || e),
-        buttons: [{ label: "閉じる", onClick: removeBanner }],
+        buttons: [
+          { label: "もう一度試す", kind: "primary", onClick: translatePage },
+          { label: "閉じる", onClick: removeBanner },
+        ],
       });
     }
   }
